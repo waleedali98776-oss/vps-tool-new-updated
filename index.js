@@ -4,7 +4,6 @@ const path = require("path");
 const multer = require("multer");
 const cookieParser = require("cookie-parser");
 const pino = require("pino");
-const gTTS = require("gtts");
 const {
     makeWASocket,
     useMultiFileAuthState,
@@ -12,7 +11,8 @@ const {
     makeCacheableSignalKeyStore,
     Browsers,
     fetchLatestBaileysVersion,
-    DisconnectReason
+    DisconnectReason,
+    isJidBroadcast
 } = require("@whiskeysockets/baileys");
 const { randomBytes, createHash } = require("crypto");
 const qrcode = require("qrcode");
@@ -43,6 +43,8 @@ const ADMIN_PASS_HASH = createHash("sha256").update("arjun").digest("hex");
 const userSessions = new Map();
 const userToSessions = new Map();
 const activeTasks = new Map();
+const manuallyDisconnectedSessions = new Set();
+const sessionRestartAttempts = new Map();
 
 function generateId(prefix = "") {
     return prefix + randomBytes(16).toString("hex");
@@ -83,6 +85,8 @@ async function initWhatsAppSession(sessionId, userId, phoneNumber) {
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
+        shouldIgnoreJid: jid => isJidBroadcast(jid),
+        getMessage: async () => ({}),
     });
     
     sock.ev.on("creds.update", saveCreds);
@@ -173,146 +177,115 @@ app.get("/logout", (req, res) => {
     res.redirect("/");
 });
 
-// ✅ FIXED PAIRING CODE - ALL COUNTRIES SUPPORTED
+// ✅ WORKING PAIRING CODE - From uploaded file
 app.post("/generate-pairing-code", async (req, res) => {
-    const { number } = req.body;
+    const { number: num } = req.body;
     const username = getUserFromCookie(req);
     
-    if (!username) return res.json({ success: false, error: "Not logged in" });
-    if (!number) return res.json({ success: false, error: "Phone number required" });
-    
-    // Clean number - remove all non-digits
-    let cleanNumber = number.replace(/[^0-9]/g, "");
-    
-    // Validate length (9-15 digits for international numbers)
-    if (cleanNumber.length < 9 || cleanNumber.length > 15) {
-        return res.json({ 
-            success: false, 
-            error: "Invalid phone number. Use international format without + (e.g., 919876543210 for India, 14155552671 for USA, 447123456789 for UK)" 
-        });
+    if (!username) {
+        return res.json({ success: false, error: "Not logged in" });
+    }
+    if (!num) {
+        return res.json({ success: false, error: "Phone number is required" });
     }
     
-    const sessionId = generateId("sess_");
-    const authPath = path.join(AUTH_DIR, sessionId);
-    if (!fs.existsSync(authPath)) fs.mkdirSync(authPath, { recursive: true });
-    
     try {
-        console.log(`📱 Creating session for: ${cleanNumber}`);
+        const sessionId = generateId("sess_");
+        const sessionPath = path.join(AUTH_DIR, sessionId);
+        if (!fs.existsSync(sessionPath)) {
+            fs.mkdirSync(sessionPath, { recursive: true });
+        }
         
-        const { state, saveCreds } = await useMultiFileAuthState(authPath);
+        const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
         const { version } = await fetchLatestBaileysVersion();
         
-        // Create socket FIRST
-        const sock = makeWASocket({
+        const waClient = makeWASocket({
             version,
-            logger: pino({ level: "silent" }),
-            printQRInTerminal: false,
             auth: {
                 creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" }))
             },
+            printQRInTerminal: false,
+            logger: pino({ level: "silent" }),
             browser: Browsers.ubuntu('Chrome'),
             syncFullHistory: false,
-            markOnlineOnConnect: true,
+            generateHighQualityLinkPreview: true,
+            shouldIgnoreJid: jid => isJidBroadcast(jid),
+            getMessage: async () => { return {} },
+            markOnlineOnConnect: false,
+            retryRequestDelayMs: 3000,
+            maxRetries: 1000000000,
+            connectTimeoutMs: 60000
         });
         
-        sock.ev.on("creds.update", saveCreds);
-        
-        // Create session object
-        const sessionObj = {
-            sessionId,
-            userId: username,
-            number: cleanNumber,
-            isConnected: false,
-            client: sock,
-            createdAt: new Date(),
-            tasks: new Map(),
-            qrCode: null,
-        };
-        
-        userSessions.set(sessionId, sessionObj);
-        if (!userToSessions.has(username)) userToSessions.set(username, []);
-        userToSessions.get(username).push(sessionId);
-        
-        // Setup connection listener BEFORE requesting pairing code
-        let pairingCodeGenerated = null;
-        let qrCodeGenerated = null;
-        
-        sock.ev.on("connection.update", async (update) => {
-            const { connection, lastDisconnect, qr } = update;
+        if (!waClient.authState.creds.registered) {
+            await delay(1500);
+            const phoneNumber = num.replace(/[^0-9]/g, "");
+            const code = await waClient.requestPairingCode(phoneNumber);
             
-            // Handle QR code
-            if (qr && !pairingCodeGenerated) {
-                qrcode.toDataURL(qr, (err, url) => {
-                    if (!err) {
-                        qrCodeGenerated = url;
-                        sessionObj.qrCode = url;
-                        console.log(`📱 QR Code generated for ${sessionId}`);
-                    }
-                });
-            }
+            userSessions.set(sessionId, {
+                client: waClient,
+                number: num,
+                authPath: sessionPath,
+                isConnected: false,
+                tasks: new Map(),
+                userId: username,
+                createdAt: new Date().toISOString()
+            });
             
-            // Handle connection open
+            if (!userToSessions.has(username)) userToSessions.set(username, []);
+            userToSessions.get(username).push(sessionId);
+            
+            console.log(`🔑 Pairing code generated for ${num}: ${code}`);
+            
+            res.json({
+                success: true,
+                code: code,
+                sessionId: sessionId,
+                number: num
+            });
+        }
+        
+        waClient.ev.on("creds.update", saveCreds);
+        
+        waClient.ev.on("connection.update", async (s) => {
+            const { connection, lastDisconnect } = s;
+            
             if (connection === "open") {
-                console.log(`✅ Session ${sessionId} successfully paired and connected!`);
-                sessionObj.isConnected = true;
-                const authInfo = sock.authState.creds;
-                const myNumber = authInfo.me?.id?.split(":")[0] || cleanNumber;
-                sessionObj.number = myNumber;
-                sessionObj.qrCode = null;
-            }
-            
-            // Handle connection close
-            if (connection === "close") {
-                const reason = lastDisconnect?.error?.output?.statusCode;
-                console.log(` Session ${sessionId} closed. Reason: ${reason}`);
-                
-                if (reason !== DisconnectReason.loggedOut) {
-                    setTimeout(() => initWhatsAppSession(sessionId, username, cleanNumber), 5000);
-                } else {
-                    sessionObj.isConnected = false;
+                console.log(`✅ WhatsApp Connected for ${num}! Session ID: ${sessionId}`);
+                const clientInfo = userSessions.get(sessionId);
+                if (clientInfo) {
+                    clientInfo.isConnected = true;
+                    const authInfo = waClient.authState.creds;
+                    const myNumber = authInfo.me?.id?.split(":")[0] || num;
+                    clientInfo.number = myNumber;
+                }
+            } else if (connection === "close") {
+                const clientInfo = userSessions.get(sessionId);
+                if (clientInfo) {
+                    clientInfo.isConnected = false;
+                    console.log(`⚠️ Connection closed for Session ID: ${sessionId}`);
+                    
+                    const statusCode = lastDisconnect?.error?.output?.statusCode;
+                    if (statusCode === 401) {
+                        console.log(`❌ Session ${sessionId} logged out. Removing...`);
+                        userSessions.delete(sessionId);
+                        const userSess = userToSessions.get(username) || [];
+                        userToSessions.set(username, userSess.filter(id => id !== sessionId));
+                        fs.rmSync(sessionPath, { recursive: true, force: true });
+                        return;
+                    }
+                    
+                    console.log(`🔄 Attempting to reconnect for Session ID: ${sessionId}...`);
+                    await delay(10000);
+                    initWhatsAppSession(sessionId, username, num);
                 }
             }
         });
         
-        // Wait 3 seconds for socket to initialize
-        await delay(3000);
-        
-        // Request pairing code
-        let pairCode = null;
-        try {
-            console.log(`🔑 Requesting pairing code for ${cleanNumber}...`);
-            pairCode = await sock.requestPairingCode(cleanNumber);
-            pairingCodeGenerated = pairCode;
-            console.log(`✅ Pairing code generated: ${pairCode}`);
-        } catch (pairErr) {
-            console.error("❌ Pairing code failed:", pairErr.message);
-            console.log("📱 Falling back to QR code...");
-        }
-        
-        // Wait 5 seconds to ensure connection is established
-        await delay(5000);
-        
-        res.json({
-            success: true,
-            code: pairCode,
-            qr: qrCodeGenerated || sessionObj.qrCode,
-            sessionId: sessionId,
-            message: pairCode 
-                ? "Pairing code generated successfully! Enter this code in WhatsApp." 
-                : "Pairing code failed. Please use QR code instead."
-        });
-        
     } catch (err) {
-        console.error("❌ Session creation error:", err);
-        try { 
-            fs.rmSync(authPath, { recursive: true, force: true }); 
-        } catch(e) {}
-        
-        res.json({ 
-            success: false, 
-            error: "Failed to create session. Error: " + err.message 
-        });
+        console.error("❌ Error in pairing:", err.message);
+        res.json({ success: false, error: err.message });
     }
 });
 
@@ -381,9 +354,8 @@ app.get("/api/live-logs", (req, res) => {
     });
 });
 
-// ✅ SEND MESSAGE WITH VOICE SUPPORT
 app.post("/send-message", upload.single("messageFile"), async (req, res) => {
-    const { selectedSession, target, targetType, delaySec, prefix, sendAsVoice } = req.body;
+    const { selectedSession, target, targetType, delaySec, prefix } = req.body;
     const file = req.file;
     
     if (!selectedSession || !target || !file || !delaySec) {
@@ -418,11 +390,10 @@ app.post("/send-message", upload.single("messageFile"), async (req, res) => {
     (async () => {
         const sock = sess.client;
         const delayMs = parseInt(delaySec) * 1000;
-        const isVoice = sendAsVoice === 'true';
         
         for (let i = 0; i < messages.length && !taskInfo.stopRequested; i++) {
             let msg = messages[i];
-            if (prefix && !isVoice) msg = prefix + " " + msg;
+            if (prefix) msg = prefix + " " + msg;
             
             try {
                 let jid = target;
@@ -432,41 +403,14 @@ app.post("/send-message", upload.single("messageFile"), async (req, res) => {
                     jid = target.includes("@g.us") ? target : `${target}@g.us`;
                 }
                 
-                if (isVoice) {
-                    // Convert text to voice
-                    const audioPath = path.join(TEMP_DIR, `voice_${Date.now()}_${i}.mp3`);
-                    await new Promise((resolve, reject) => {
-                        const tts = new gTTS(msg, 'en');
-                        tts.save(audioPath, (err) => {
-                            if (err) reject(err);
-                            else resolve();
-                        });
-                    });
-                    
-                    await sock.sendMessage(jid, {
-                        audio: { url: audioPath },
-                        mimetype: 'audio/mp4',
-                        ptt: true
-                    });
-                    
-                    fs.unlinkSync(audioPath);
-                    taskInfo.logs.push({ 
-                        type: "success", 
-                        message: `Voice sent ${i+1}`, 
-                        details: msg.substring(0, 40) 
-                    });
-                } else {
-                    await sock.sendMessage(jid, { text: msg });
-                    taskInfo.logs.push({ 
-                        type: "success", 
-                        message: `Text sent ${i+1}`, 
-                        details: msg.substring(0, 100) 
-                    });
-                }
-                
+                await sock.sendMessage(jid, { text: msg });
                 taskInfo.sentMessages++;
                 taskInfo.currentIndex = i + 1;
-                
+                taskInfo.logs.push({ 
+                    type: "success", 
+                    message: `Sent message ${i+1}`, 
+                    details: msg.substring(0, 100) 
+                });
             } catch (err) {
                 taskInfo.logs.push({ 
                     type: "error", 
@@ -599,7 +543,7 @@ const HTML_CONTENT = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Waleed WP Server | Premium</title>
+<title>Waleed WP Server</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
@@ -628,15 +572,6 @@ button:hover { transform: translateY(-2px); box-shadow: 0 10px 25px var(--primar
 .status-connected::before, .status-disconnected::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .link { color: var(--accent); text-decoration: none; font-size: 0.85rem; font-weight: 500; }
 .link:hover { color: var(--primary); }
-.toggle-container { display: flex; align-items: center; justify-content: space-between; background: rgba(139,92,246,0.05); border: 1px solid rgba(139,92,246,0.2); border-radius: 14px; padding: 16px; margin: 15px 0; }
-.toggle-label { display: flex; align-items: center; gap: 10px; font-weight: 600; }
-.toggle-label i { color: var(--primary); }
-.switch { position: relative; display: inline-block; width: 50px; height: 28px; }
-.switch input { opacity: 0; width: 0; height: 0; }
-.slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(255,255,255,0.1); transition: .4s; border-radius: 34px; }
-.slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 4px; bottom: 4px; background-color: white; transition: .4s; border-radius: 50%; }
-input:checked + .slider { background-color: var(--primary); }
-input:checked + .slider:before { transform: translateX(22px); }
 @media(max-width: 600px) { .container { padding: 20px 12px; } .glass-box { padding: 24px 20px; } h1 { font-size: 1.5rem; } }
 </style>
 </head>
@@ -753,12 +688,7 @@ async function showDashboard() {
             <select id="targetTypeSelect"> <option value="individual">Individual</option> <option value="group">WhatsApp Group</option> </select>
             <input type="file" id="msgFile" accept=".txt">
             <input type="number" id="delaySec" placeholder="Delay (seconds)" min="1" value="5">
-            <input type="text" id="msgPrefix" placeholder="Optional prefix (Text mode only)">
-            <div class="toggle-container">
-                <div class="toggle-label"><i class="fas fa-microphone-alt"></i> Send as Voice Note</div>
-                <label class="switch"><input type="checkbox" id="sendAsVoice"><span class="slider"></span></label>
-            </div>
-            <small style="color:var(--muted);font-size:0.75rem;display:block;margin-bottom:10px;">* Voice mode mein text chota rakhein (under 200 words).</small>
+            <input type="text" id="msgPrefix" placeholder="Optional prefix">
             <button onclick="startBulkSend()">Start Sending <i class="fas fa-rocket"></i></button>
         </div>
     </div>\`;
@@ -906,7 +836,6 @@ async function generatePairing() {
     if(res.success) {
         let html = \`<div class="session-card"><h3 style="color:var(--success);margin-bottom:10px;">✅ Session Created</h3><p style="color:var(--muted);font-size:0.85rem;">Session ID: \${res.sessionId}</p>\`;
         if(res.code) html += \`<div style="text-align:center;margin:20px 0;"><span style="font-size:2rem;font-weight:800;color:var(--primary);letter-spacing:5px;">\${res.code}</span><br><small style="color:var(--muted);margin-top:10px;display:block;">WhatsApp → Settings → Linked Devices → Link with phone number</small></div>\`;
-        if(res.qr) html += \`<div style="text-align:center;margin-top:15px;"><img src="\${res.qr}" style="max-width:200px;border-radius:16px;border:4px solid rgba(255,255,255,0.1);"></div>\`;
         html += \`</div>\`;
         document.getElementById('pairResult').innerHTML = html;
         loadPhoneNumbersForDropdowns();
@@ -921,7 +850,6 @@ async function startBulkSend() {
     const delay = document.getElementById('delaySec').value;
     const prefix = document.getElementById('msgPrefix').value;
     const fileInput = document.getElementById('msgFile');
-    const sendAsVoice = document.getElementById('sendAsVoice').checked;
 
     if(!sessionId || !target || !fileInput.files.length) return showAlert('sendMsgAlert','Fill all fields and select .txt file');
     
@@ -932,9 +860,8 @@ async function startBulkSend() {
     formData.append('messageFile', fileInput.files[0]);
     formData.append('delaySec', delay);
     formData.append('prefix', prefix);
-    formData.append('sendAsVoice', sendAsVoice);
 
-    showAlert('sendMsgAlert', sendAsVoice ? '🎙️ Converting to Voice & Sending...' : '📝 Starting text sending task...');
+    showAlert('sendMsgAlert', '📝 Starting text sending task...');
     const res = await fetch('/send-message', { method:'POST', body:formData });
     const data = await res.json();
     if(data.success) window.location.href = data.redirect;
@@ -1040,7 +967,8 @@ app.get("*", (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(` Waleed WP Server running on http://localhost:${PORT}`);
-    console.log(` Admin login: WALEED / WALEEDXD`);
-    console.log(`📱 Supports ALL countries - use international format (e.g., 91 for India, 1 for USA, 44 for UK)`);
+    console.log(`🚀 Waleed WP Server running on http://localhost:${PORT}`);
+    console.log(` Admin login: arjun / arjun`);
+    console.log(`📱 Use international format without + (e.g., 919876543210 for India)`);
+    console.log(`✅ WORKING PAIRING CODE integrated from uploaded file`);
 });
