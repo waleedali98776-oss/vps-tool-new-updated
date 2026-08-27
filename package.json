@@ -1,16 +1,26 @@
 {
   "name": "waleed-wp-server",
   "version": "1.0.0",
-  "main": "newwps2029.js",
+  "description": "Waleed WhatsApp Server - Bulk Sender with Voice Note",
+  "main": "index.js",
   "scripts": {
-    "start": "node newwps2029.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
+  "keywords": ["whatsapp", "baileys", "bulk-sender", "voice-note"],
+  "author": "Waleed",
+  "license": "MIT",
   "dependencies": {
     "@whiskeysockets/baileys": "^6.7.5",
     "cookie-parser": "^1.4.6",
     "express": "^4.18.2",
+    "gtts": "^0.2.1",
     "multer": "^1.4.5-lts.1",
     "pino": "^8.15.0",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "node-cache": "^5.1.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
