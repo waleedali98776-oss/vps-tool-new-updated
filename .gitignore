@@ -1,0 +1,6 @@
+node_modules
+auth_sessions
+uploads
+temp
+public
+.env
